@@ -36,7 +36,7 @@ fn main() {
 fn set_installed_view(
     installed: bool,
     arrow: &gtk::Image,
-    folder_card: &gtk::Frame,
+    folder_card: &gtk::Box,
     choose_button: &gtk::Button,
     uninstall_button: &gtk::Button,
     drag_source: &gtk::DragSource,
@@ -69,7 +69,7 @@ fn inspect_into_ui(
     app_details: &gtk::Label,
     status: &gtk::Label,
     arrow: &gtk::Image,
-    folder_card: &gtk::Frame,
+    folder_card: &gtk::Box,
     choose_button: &gtk::Button,
     uninstall_button: &gtk::Button,
     drag_source: &gtk::DragSource,
@@ -151,104 +151,95 @@ fn inspect_into_ui(
 }
 
 fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
-    adw::StyleManager::default().set_color_scheme(adw::ColorScheme::PreferDark);
+    // Follow the system light/dark preference.
+    // Use `adw::ColorScheme::PreferDark` here if you want to always default to dark.
+    adw::StyleManager::default().set_color_scheme(adw::ColorScheme::Default);
 
-    // AppDrop's theme
+    // AppDrop's theme (uses libadwaita named colors so it adapts to any distro/theme)
 
     let css_provider = gtk::CssProvider::new();
 
     css_provider.load_from_data(
         r#"
-        .appdrop-window {
-            background-color: #111116;
-            color: #f4f1fa;
-        }
-
         .appdrop-heading {
-            color: #f7f4ff;
-            font-size: 30px;
+            font-size: 28px;
             font-weight: 800;
-            letter-spacing: -0.8px;
+            letter-spacing: -0.5px;
         }
 
         .appdrop-subtitle {
-            color: #aaa5b8;
+            opacity: 0.65;
             font-size: 14px;
         }
 
         .appdrop-eyebrow {
-            color: #b49aff;
+            color: #a78bfa;
             font-size: 10px;
             font-weight: 800;
             letter-spacing: 1.5px;
         }
 
         .appdrop-card {
-            background-color: #1b1a23;
-            color: #f4f1fa;
-            border: 1px solid #34313f;
+            background-color: alpha(@window_fg_color, 0.05);
+            border: 1px solid alpha(@window_fg_color, 0.10);
             border-radius: 18px;
+            box-shadow: 0 2px 8px alpha(black, 0.18);
         }
 
         .appdrop-icon-tile {
-            background-color: #29213c;
-            border: 1px solid #403258;
+            background: alpha(#8b5cf6, 0.18);
+            border: 1px solid alpha(#a78bfa, 0.30);
             border-radius: 20px;
             padding: 18px;
         }
 
         .appdrop-app-name {
-            color: #f7f4ff;
             font-size: 19px;
-            font-weight: 750;
+            font-weight: 700;
         }
 
         .appdrop-muted {
-            color: #b9b3c8;
+            opacity: 0.65;
         }
 
         .appdrop-section-title {
-            color: #b49aff;
+            color: #a78bfa;
             font-size: 11px;
-            font-weight: 750;
+            font-weight: 700;
             letter-spacing: 0.8px;
         }
 
         .appdrop-drop-hover {
-            background-color: #29213c;
-            border: 2px solid #b49aff;
-            border-radius: 18px;
+            background: alpha(#8b5cf6, 0.20);
+            border: 2px solid #a78bfa;
         }
 
         button.appdrop-primary {
-            background-color: #8b5cf6;
-            color: #ffffff;
+            background: #8b5cf6;
+            color: white;
             min-height: 44px;
             font-weight: 700;
             border-radius: 12px;
-            border: 1px solid #a78bfa;
+            border: none;
         }
 
         button.appdrop-primary:hover {
-            background-color: #a78bfa;
-            color: #ffffff;
+            background: #a78bfa;
         }
 
         button.appdrop-secondary {
-            background-color: #29213c;
-            color: #e2d6ff;
+            background: alpha(@window_fg_color, 0.08);
             min-height: 42px;
-            border: 1px solid #49395f;
             border-radius: 12px;
+            border: none;
         }
 
         button.appdrop-secondary:hover {
-            background-color: #38294e;
-            color: #ffffff;
+            background: alpha(@window_fg_color, 0.14);
         }
 
         .appdrop-status {
-            color: #b9b3c8;
+            opacity: 0.65;
             font-size: 12px;
         }
         "#,
@@ -267,20 +258,17 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("AppDrop")
-        .default_width(720)
-        .default_height(650)
-        .resizable(false)
+        .default_width(640)
+        .default_height(700)
         .build();
-
-    window.add_css_class("appdrop-window");
 
     let selected_path: SelectedPath = Rc::new(RefCell::new(None));
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 22);
-    content.set_margin_top(30);
+    content.set_margin_top(8);
     content.set_margin_bottom(26);
-    content.set_margin_start(32);
-    content.set_margin_end(32);
+    content.set_margin_start(24);
+    content.set_margin_end(24);
 
     // Header.
 
@@ -340,6 +328,8 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     let app_card_content = gtk::Box::new(gtk::Orientation::Vertical, 14);
     app_card_content.set_halign(gtk::Align::Center);
     app_card_content.set_valign(gtk::Align::Center);
+    app_card_content.set_hexpand(true);
+    app_card_content.set_vexpand(true);
     app_card_content.set_margin_top(28);
     app_card_content.set_margin_bottom(28);
     app_card_content.set_margin_start(20);
@@ -349,10 +339,10 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     app_card_content.append(&app_name);
     app_card_content.append(&app_hint);
 
-    let app_card = gtk::Frame::new(None);
+    let app_card = gtk::Box::new(gtk::Orientation::Vertical, 0);
     app_card.add_css_class("appdrop-card");
     app_card.set_size_request(220, 230);
-    app_card.set_child(Some(&app_card_content));
+    app_card.append(&app_card_content);
 
     // Applications destination.
 
@@ -372,6 +362,8 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     let folder_content = gtk::Box::new(gtk::Orientation::Vertical, 14);
     folder_content.set_halign(gtk::Align::Center);
     folder_content.set_valign(gtk::Align::Center);
+    folder_content.set_hexpand(true);
+    folder_content.set_vexpand(true);
     folder_content.set_margin_top(28);
     folder_content.set_margin_bottom(28);
     folder_content.set_margin_start(20);
@@ -381,10 +373,10 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     folder_content.append(&folder_name);
     folder_content.append(&folder_hint);
 
-    let folder_card = gtk::Frame::new(None);
+    let folder_card = gtk::Box::new(gtk::Orientation::Vertical, 0);
     folder_card.add_css_class("appdrop-card");
     folder_card.set_size_request(220, 230);
-    folder_card.set_child(Some(&folder_content));
+    folder_card.append(&folder_content);
 
     let app_row = gtk::Box::new(gtk::Orientation::Horizontal, 20);
     app_row.set_halign(gtk::Align::Center);
@@ -407,6 +399,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     app_details.set_xalign(0.0);
 
     let details_content = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    details_content.set_hexpand(true);
     details_content.set_margin_top(18);
     details_content.set_margin_bottom(18);
     details_content.set_margin_start(20);
@@ -414,9 +407,9 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     details_content.append(&details_heading);
     details_content.append(&app_details);
 
-    let details_card = gtk::Frame::new(None);
+    let details_card = gtk::Box::new(gtk::Orientation::Vertical, 0);
     details_card.add_css_class("appdrop-card");
-    details_card.set_child(Some(&details_content));
+    details_card.append(&details_content);
 
     // Actions.
 
@@ -451,7 +444,29 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     content.append(&uninstall_button);
     content.append(&status_row);
 
-    window.set_content(Some(&content));
+    // Window chrome: header bar + centered, scrollable content.
+    // Works the same on GNOME, Hyprland, KDE, etc.
+
+    let header_bar = adw::HeaderBar::new();
+    header_bar.add_css_class("flat");
+    header_bar.set_title_widget(Some(&gtk::Label::new(None))); // hide title text
+
+    let clamp = adw::Clamp::builder()
+        .maximum_size(600)
+        .child(&content)
+        .build();
+
+    let scrolled = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .child(&clamp)
+        .build();
+
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header_bar);
+    toolbar.set_content(Some(&scrolled));
+
+    window.set_content(Some(&toolbar));
 
     // Drag source and floating preview.
 

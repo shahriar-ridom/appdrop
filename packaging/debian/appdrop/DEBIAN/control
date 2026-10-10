@@ -1,0 +1,12 @@
+
+Package: appdrop
+Version: 0.1.0-1
+Section: utils
+Priority: optional
+Architecture: amd64
+Depends: libc6, libgcc-s1, libgtk-4-1, libadwaita-1-0, squashfs-tools
+Maintainer: AppDrop Maintainers
+Description: AppImage installer and manager
+ A GTK4 and Libadwaita desktop application for inspecting,
+ installing, and managing AppImage applications.
+
