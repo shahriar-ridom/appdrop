@@ -1,16 +1,59 @@
 mod appimage;
 mod installer;
+mod library;
 mod metadata;
+mod version;
 
 use adw::prelude::*;
 use gtk4 as gtk;
 use libadwaita as adw;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use metadata::{AppMetadata, MetadataError};
+
 type SelectedPath = Rc<RefCell<Option<PathBuf>>>;
+
+/// The one AppDrop window, kept so a second launch can reuse it.
+#[derive(Clone)]
+struct AppWindow {
+    window: adw::ApplicationWindow,
+    stack: adw::ViewStack,
+    ui: Ui,
+}
+
+impl AppWindow {
+    fn show_library(&self) {
+        self.stack.set_visible_child_name("library");
+        self.window.present();
+    }
+
+    fn show_installer(&self, path: Option<PathBuf>) {
+        self.stack.set_visible_child_name("install");
+        self.window.present();
+
+        if let Some(path) = path {
+            self.ui.inspect(path);
+        }
+    }
+}
+
+type CurrentWindow = Rc<RefCell<Option<AppWindow>>>;
+
+/// The existing window if AppDrop is already running, otherwise a new one.
+fn window_for(app: &adw::Application, current: &CurrentWindow) -> AppWindow {
+    if !app.windows().is_empty()
+        && let Some(existing) = current.borrow().clone()
+    {
+        return existing;
+    }
+
+    let created = build_ui(app);
+    *current.borrow_mut() = Some(created.clone());
+    created
+}
 
 fn main() {
     let app = adw::Application::builder()
@@ -18,139 +61,372 @@ fn main() {
         .flags(gtk::gio::ApplicationFlags::HANDLES_OPEN)
         .build();
 
-    app.connect_activate(|app| {
-        if app.active_window().is_none() {
-            build_ui(app, None);
-        }
+    let current: CurrentWindow = Rc::new(RefCell::new(None));
+
+    // Launching AppDrop itself opens the library of installed apps.
+    let current_for_activate = current.clone();
+    app.connect_activate(move |app| {
+        window_for(app, &current_for_activate).show_library();
     });
 
-    app.connect_open(|app, files, _hint| {
-        if let Some(path) = files.first().and_then(|file| file.path()) {
-            build_ui(app, Some(path));
-        }
+    // Opening an AppImage (double click, "Open with") goes straight to the
+    // installer.
+    app.connect_open(move |app, files, _hint| {
+        let path = files.first().and_then(|file| file.path());
+        window_for(app, &current).show_installer(path);
     });
 
     app.run();
 }
 
-fn set_installed_view(
-    installed: bool,
-    arrow: &gtk::Image,
-    folder_card: &gtk::Box,
-    choose_button: &gtk::Button,
-    uninstall_button: &gtk::Button,
-    drag_source: &gtk::DragSource,
-    app_hint: &gtk::Label,
-) {
-    arrow.set_visible(!installed);
-    folder_card.set_visible(!installed);
-    choose_button.set_visible(!installed);
-
-    uninstall_button.set_visible(installed);
-    uninstall_button.set_sensitive(installed);
-
-    drag_source.set_actions(if installed {
-        gtk::gdk::DragAction::empty()
-    } else {
-        gtk::gdk::DragAction::COPY
-    });
-
-    app_hint.set_text(if installed {
-        "Installed application"
-    } else {
-        "Drag this icon to install"
-    });
+/// Handles to every widget the install flow updates, plus shared state.
+#[derive(Clone)]
+struct Ui {
+    app_icon: gtk::Image,
+    app_name: gtk::Label,
+    app_details: gtk::Label,
+    app_hint: gtk::Label,
+    status: gtk::Label,
+    status_icon: gtk::Image,
+    arrow: gtk::Image,
+    folder_card: gtk::Box,
+    folder_icon: gtk::Image,
+    folder_hint: gtk::Label,
+    choose_button: gtk::Button,
+    update_button: gtk::Button,
+    uninstall_button: gtk::Button,
+    drag_source: gtk::DragSource,
+    selected_path: SelectedPath,
+    busy: Rc<Cell<bool>>,
 }
 
-fn inspect_into_ui(
-    path: PathBuf,
-    app_icon: &gtk::Image,
-    app_name: &gtk::Label,
-    app_details: &gtk::Label,
-    status: &gtk::Label,
-    arrow: &gtk::Image,
-    folder_card: &gtk::Box,
-    choose_button: &gtk::Button,
-    uninstall_button: &gtk::Button,
-    drag_source: &gtk::DragSource,
-    app_hint: &gtk::Label,
-    selected_path: &SelectedPath,
-) {
-    status.set_text("Inspecting application…");
+enum InstallOutcome {
+    AlreadyInstalled(String),
+    Installed(String, PathBuf),
+}
 
-    match metadata::inspect(&path) {
-        Ok(info) => {
-            let icon_name = info
-                .icon
-                .as_deref()
-                .filter(|icon| !icon.is_empty() && !icon.contains('/'))
-                .unwrap_or("application-x-executable-symbolic");
+impl Ui {
+    fn set_installed_view(&self, installed: bool) {
+        self.arrow.set_visible(!installed);
+        self.folder_card.set_visible(!installed);
 
-            app_icon.set_icon_name(Some(icon_name));
-            app_name.set_text(&info.name);
+        self.uninstall_button.set_visible(installed);
+        self.uninstall_button.set_sensitive(installed);
 
-            let categories = if info.categories.is_empty() {
-                "Not specified".to_string()
-            } else {
-                info.categories.join(", ")
-            };
-
-            app_details.set_text(&format!(
-                "Desktop entry: {}\n\
-                 Icon: {}\n\
-                 Categories: {}\n\
-                 Launch command: {}\n\
-                 SquashFS offset: {} bytes",
-                info.desktop_file,
-                info.icon.as_deref().unwrap_or("Not specified"),
-                categories,
-                info.exec.as_deref().unwrap_or("Not specified"),
-                info.squashfs_offset,
-            ));
-
-            let installed = installer::is_installed(&info);
-
-            set_installed_view(
-                installed,
-                arrow,
-                folder_card,
-                choose_button,
-                uninstall_button,
-                drag_source,
-                app_hint,
-            );
-
-            status.set_text(if installed {
-                "This application is managed by AppDrop."
-            } else {
-                "Ready to install. Drag the app icon into Applications."
-            });
-
-            *selected_path.borrow_mut() = Some(path);
+        if !installed {
+            self.update_button.set_visible(false);
         }
-        Err(error) => {
-            app_icon.set_icon_name(Some("application-x-executable-symbolic"));
-            app_name.set_text("Unsupported application");
-            app_details.set_text("AppDrop couldn't read this application's metadata.");
 
-            status.set_text(&format!("Inspection failed: {error}"));
+        self.drag_source.set_actions(if installed {
+            gtk::gdk::DragAction::empty()
+        } else {
+            gtk::gdk::DragAction::COPY
+        });
 
-            set_installed_view(
-                false,
-                arrow,
-                folder_card,
-                choose_button,
-                uninstall_button,
-                drag_source,
-                app_hint,
-            );
+        self.app_hint.set_text(if installed {
+            "Installed application"
+        } else {
+            "Drag this icon to install"
+        });
+    }
 
-            *selected_path.borrow_mut() = None;
+    fn reset_folder(&self) {
+        self.folder_icon.set_icon_name(Some("folder-symbolic"));
+        self.folder_hint.set_text("Drop here to install");
+    }
+
+    fn set_status(&self, icon: &str, text: &str) {
+        self.status_icon.set_icon_name(Some(icon));
+        self.status.set_text(text);
+    }
+
+    /// Marks a background job as running. Returns false if one already is.
+    fn begin(&self, icon: &str, text: &str) -> bool {
+        if self.busy.replace(true) {
+            return false;
         }
+
+        self.choose_button.set_sensitive(false);
+        self.update_button.set_sensitive(false);
+        self.uninstall_button.set_sensitive(false);
+        self.set_status(icon, text);
+        true
+    }
+
+    fn end(&self) {
+        self.busy.set(false);
+        self.choose_button.set_sensitive(true);
+        self.update_button.set_sensitive(true);
+        self.uninstall_button.set_sensitive(true);
+    }
+
+    /// Inspect `path` on a worker thread, then show the result.
+    fn inspect(&self, path: PathBuf) {
+        if !self.begin("content-loading-symbolic", "Inspecting application…") {
+            return;
+        }
+
+        self.reset_folder();
+
+        let ui = self.clone();
+
+        gtk::glib::spawn_future_local(async move {
+            let worker_path = path.clone();
+            let result = gtk::gio::spawn_blocking(move || metadata::inspect(&worker_path)).await;
+
+            ui.end();
+
+            match result {
+                Ok(result) => ui.show_inspection(path, result),
+                Err(_) => ui.set_status("dialog-error-symbolic", "Inspection failed unexpectedly."),
+            }
+        });
+    }
+
+    fn show_inspection(&self, path: PathBuf, result: Result<AppMetadata, MetadataError>) {
+        match result {
+            Ok(info) => {
+                let icon_name = info
+                    .icon
+                    .as_deref()
+                    .filter(|icon| !icon.is_empty() && !icon.contains('/'))
+                    .unwrap_or("application-x-executable-symbolic");
+
+                self.app_icon.set_icon_name(Some(icon_name));
+                self.app_name.set_text(&info.name);
+
+                let categories = if info.categories.is_empty() {
+                    "Not specified".to_string()
+                } else {
+                    info.categories.join(", ")
+                };
+
+                self.app_details.set_text(&format!(
+                    "Version: {}\n\
+                     Desktop entry: {}\n\
+                     Icon: {}\n\
+                     Categories: {}\n\
+                     Launch command: {}\n\
+                     SquashFS offset: {} bytes",
+                    info.version.as_deref().unwrap_or("Unknown"),
+                    info.desktop_file,
+                    info.icon.as_deref().unwrap_or("Not specified"),
+                    categories,
+                    info.exec.as_deref().unwrap_or("Not specified"),
+                    info.squashfs_offset,
+                ));
+
+                let installed_version = installer::installed_version(&info);
+                let installed = installed_version.is_some();
+                self.set_installed_view(installed);
+
+                let installed_version = installed_version.flatten();
+                let offer = installed.then(|| {
+                    version::update_label(installed_version.as_deref(), info.version.as_deref())
+                });
+
+                match offer.flatten() {
+                    Some(label) => {
+                        self.update_button.set_label(&label);
+                        self.update_button.set_visible(true);
+                    }
+                    None => self.update_button.set_visible(false),
+                }
+
+                let status = match (installed, self.update_button.is_visible()) {
+                    (false, _) => {
+                        "Ready to install. Drag the app icon into Applications.".to_string()
+                    }
+                    (true, true) => format!(
+                        "{} is already installed{}. You can replace it with this file.",
+                        info.name,
+                        installed_version
+                            .as_deref()
+                            .map(|v| format!(" (version {v})"))
+                            .unwrap_or_default(),
+                    ),
+                    (true, false) => "This application is managed by AppDrop.".to_string(),
+                };
+
+                self.set_status("emblem-information-symbolic", &status);
+
+                *self.selected_path.borrow_mut() = Some(path);
+            }
+            Err(error) => {
+                self.app_icon
+                    .set_icon_name(Some("application-x-executable-symbolic"));
+                self.app_name.set_text("Unsupported application");
+                self.app_details
+                    .set_text("AppDrop couldn't read this application's metadata.");
+
+                self.set_status(
+                    "dialog-error-symbolic",
+                    &format!("Inspection failed: {error}"),
+                );
+
+                self.set_installed_view(false);
+                *self.selected_path.borrow_mut() = None;
+            }
+        }
+    }
+
+    /// Install the selected AppImage on a worker thread.
+    fn install(&self) {
+        let Some(path) = self.selected_path.borrow().clone() else {
+            self.set_status(
+                "dialog-error-symbolic",
+                "Choose or open an AppImage before installing.",
+            );
+            return;
+        };
+
+        if !self.begin("content-loading-symbolic", "Installing application…") {
+            return;
+        }
+
+        let ui = self.clone();
+
+        gtk::glib::spawn_future_local(async move {
+            let result = gtk::gio::spawn_blocking(move || -> Result<InstallOutcome, String> {
+                let info = metadata::inspect(&path)
+                    .map_err(|e| format!("Could not inspect AppImage: {e}"))?;
+
+                if installer::is_installed(&info) {
+                    return Ok(InstallOutcome::AlreadyInstalled(info.name));
+                }
+
+                let installed = installer::install(&path, &info)
+                    .map_err(|e| format!("Installation failed: {e}"))?;
+
+                Ok(InstallOutcome::Installed(info.name, installed))
+            })
+            .await;
+
+            ui.end();
+
+            match result {
+                Ok(Ok(InstallOutcome::AlreadyInstalled(name))) => {
+                    ui.set_installed_view(true);
+                    ui.set_status(
+                        "emblem-ok-symbolic",
+                        &format!("{name} is already installed."),
+                    );
+                }
+                Ok(Ok(InstallOutcome::Installed(name, installed))) => {
+                    ui.set_installed_view(true);
+                    ui.folder_icon.set_icon_name(Some("emblem-ok-symbolic"));
+                    ui.folder_hint.set_text("Installed!");
+                    ui.set_status(
+                        "emblem-ok-symbolic",
+                        &format!("{name} installed successfully · {}", installed.display()),
+                    );
+                }
+                Ok(Err(message)) => ui.set_status("dialog-error-symbolic", &message),
+                Err(_) => {
+                    ui.set_status("dialog-error-symbolic", "Installation failed unexpectedly.")
+                }
+            }
+        });
+    }
+
+    /// Replace the installed copy with the selected AppImage.
+    fn update(&self) {
+        let Some(path) = self.selected_path.borrow().clone() else {
+            self.set_status("dialog-error-symbolic", "Choose an AppImage first.");
+            return;
+        };
+
+        if !self.begin("content-loading-symbolic", "Updating application…") {
+            return;
+        }
+
+        let ui = self.clone();
+
+        gtk::glib::spawn_future_local(async move {
+            let worker_path = path.clone();
+
+            let result = gtk::gio::spawn_blocking(move || -> Result<AppMetadata, String> {
+                let info = metadata::inspect(&worker_path)
+                    .map_err(|e| format!("Could not inspect AppImage: {e}"))?;
+
+                installer::update(&worker_path, &info)
+                    .map_err(|e| format!("Update failed: {e}"))?;
+
+                Ok(info)
+            })
+            .await;
+
+            ui.end();
+
+            match result {
+                Ok(Ok(info)) => {
+                    let message = match &info.version {
+                        Some(version) => format!("{} is now version {version}.", info.name),
+                        None => format!("{} has been updated.", info.name),
+                    };
+
+                    ui.show_inspection(path, Ok(info));
+                    ui.set_status("emblem-ok-symbolic", &message);
+                }
+                Ok(Err(message)) => ui.set_status("dialog-error-symbolic", &message),
+                Err(_) => ui.set_status("dialog-error-symbolic", "Update failed unexpectedly."),
+            }
+        });
+    }
+
+    /// Uninstall the selected application on a worker thread.
+    fn uninstall(&self) {
+        let Some(path) = self.selected_path.borrow().clone() else {
+            self.set_status("dialog-error-symbolic", "Choose an AppImage first.");
+            return;
+        };
+
+        if !self.begin("content-loading-symbolic", "Uninstalling application…") {
+            return;
+        }
+
+        let ui = self.clone();
+
+        gtk::glib::spawn_future_local(async move {
+            let result = gtk::gio::spawn_blocking(move || -> Result<String, String> {
+                let info = metadata::inspect(&path)
+                    .map_err(|e| format!("Could not inspect application: {e}"))?;
+
+                installer::uninstall(&info).map_err(|e| format!("Uninstallation failed: {e}"))?;
+
+                Ok(info.name)
+            })
+            .await;
+
+            ui.end();
+
+            match result {
+                Ok(Ok(name)) => {
+                    ui.set_installed_view(false);
+                    ui.app_icon
+                        .set_icon_name(Some("application-x-executable-symbolic"));
+                    ui.app_name.set_text("Your AppImage");
+                    ui.app_details
+                        .set_text("Application removed. The original AppImage is untouched.");
+                    ui.reset_folder();
+                    ui.set_status(
+                        "emblem-ok-symbolic",
+                        &format!("{name} has been uninstalled."),
+                    );
+
+                    *ui.selected_path.borrow_mut() = None;
+                }
+                Ok(Err(message)) => ui.set_status("dialog-error-symbolic", &message),
+                Err(_) => ui.set_status(
+                    "dialog-error-symbolic",
+                    "Uninstallation failed unexpectedly.",
+                ),
+            }
+        });
     }
 }
 
-fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
+fn build_ui(app: &adw::Application) -> AppWindow {
     // Follow the system light/dark preference.
     // Use `adw::ColorScheme::PreferDark` here if you want to always default to dark.
     adw::StyleManager::default().set_color_scheme(adw::ColorScheme::Default);
@@ -417,6 +693,11 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     choose_button.add_css_class("appdrop-primary");
     choose_button.set_halign(gtk::Align::Fill);
 
+    let update_button = gtk::Button::with_label("Update");
+    update_button.add_css_class("appdrop-primary");
+    update_button.set_halign(gtk::Align::Fill);
+    update_button.set_visible(false);
+
     let uninstall_button = gtk::Button::with_label("Uninstall Application");
     uninstall_button.add_css_class("appdrop-secondary");
     uninstall_button.set_halign(gtk::Align::Fill);
@@ -440,6 +721,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
 
     content.append(&app_row);
     content.append(&details_card);
+    content.append(&update_button);
     content.append(&choose_button);
     content.append(&uninstall_button);
     content.append(&status_row);
@@ -449,7 +731,6 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
 
     let header_bar = adw::HeaderBar::new();
     header_bar.add_css_class("flat");
-    header_bar.set_title_widget(Some(&gtk::Label::new(None))); // hide title text
 
     let clamp = adw::Clamp::builder()
         .maximum_size(600)
@@ -462,9 +743,67 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
         .child(&clamp)
         .build();
 
+    // Two pages: the library of installed apps (the default when AppDrop is
+    // launched) and the installer (what opening an AppImage shows).
+    let ui_slot: Rc<RefCell<Option<Ui>>> = Rc::new(RefCell::new(None));
+    let toasts = adw::ToastOverlay::new();
+    let stack = adw::ViewStack::new();
+
+    let on_install: Rc<dyn Fn()> = {
+        let stack = stack.clone();
+        let ui_slot = ui_slot.clone();
+
+        Rc::new(move || {
+            stack.set_visible_child_name("install");
+
+            if let Some(ui) = ui_slot.borrow().as_ref() {
+                ui.choose_button.emit_clicked();
+            }
+        })
+    };
+
+    let on_update: Rc<dyn Fn(PathBuf)> = {
+        let stack = stack.clone();
+        let ui_slot = ui_slot.clone();
+
+        Rc::new(move |path| {
+            stack.set_visible_child_name("install");
+
+            if let Some(ui) = ui_slot.borrow().as_ref() {
+                ui.inspect(path);
+            }
+        })
+    };
+
+    let library = library::Library::new(&window, &toasts, on_install, on_update);
+    library.refresh();
+
+    stack.add_titled_with_icon(
+        &library.widget,
+        Some("library"),
+        "Library",
+        "view-list-symbolic",
+    );
+    stack.add_titled_with_icon(&scrolled, Some("install"), "Install", "list-add-symbolic");
+
+    let library_for_switch = library.clone();
+    stack.connect_visible_child_name_notify(move |stack| {
+        if stack.visible_child_name().as_deref() == Some("library") {
+            library_for_switch.refresh();
+        }
+    });
+
+    let switcher = adw::ViewSwitcher::builder()
+        .stack(&stack)
+        .policy(adw::ViewSwitcherPolicy::Wide)
+        .build();
+    header_bar.set_title_widget(Some(&switcher));
+
+    toasts.set_child(Some(&stack));
+
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header_bar);
-    toolbar.set_content(Some(&scrolled));
+    toolbar.set_content(Some(&toasts));
 
     window.set_content(Some(&toolbar));
 
@@ -497,6 +836,25 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
 
     app_icon.add_controller(drag_source.clone());
 
+    let ui = Ui {
+        app_icon: app_icon.clone(),
+        app_name,
+        app_details,
+        app_hint,
+        status,
+        status_icon,
+        arrow,
+        folder_card: folder_card.clone(),
+        folder_icon,
+        folder_hint,
+        choose_button: choose_button.clone(),
+        update_button: update_button.clone(),
+        uninstall_button: uninstall_button.clone(),
+        drag_source: drag_source.clone(),
+        selected_path,
+        busy: Rc::new(Cell::new(false)),
+    };
+
     // Drop target and hover state.
 
     let drop_target = gtk::DropTarget::new(String::static_type(), gtk::gdk::DragAction::COPY);
@@ -514,86 +872,14 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
         folder_for_leave.remove_css_class("appdrop-drop-hover");
     });
 
-    let selected_for_drop = selected_path.clone();
-    let status_for_drop = status.clone();
-    let uninstall_for_drop = uninstall_button.clone();
-    let folder_icon_for_drop = folder_icon.clone();
-    let folder_hint_for_drop = folder_hint.clone();
-    let drag_for_drop = drag_source.clone();
-    let arrow_for_drop = arrow.clone();
-    let folder_card_for_drop = folder_card.clone();
-    let choose_for_drop = choose_button.clone();
-    let app_hint_for_drop = app_hint.clone();
-    let status_icon_for_drop = status_icon.clone();
+    let ui_for_drop = ui.clone();
 
     drop_target.connect_drop(move |_, value, _, _| {
         if value.get::<String>().ok().as_deref() != Some("appdrop-install") {
             return false;
         }
 
-        let Some(path) = selected_for_drop.borrow().clone() else {
-            status_for_drop.set_text("Choose or open an AppImage before installing.");
-            return false;
-        };
-
-        status_for_drop.set_text("Installing application…");
-        status_icon_for_drop.set_icon_name(Some("content-loading-symbolic"));
-
-        match metadata::inspect(&path) {
-            Ok(info) => {
-                if installer::is_installed(&info) {
-                    status_for_drop.set_text(&format!("{} is already installed.", info.name));
-
-                    set_installed_view(
-                        true,
-                        &arrow_for_drop,
-                        &folder_card_for_drop,
-                        &choose_for_drop,
-                        &uninstall_for_drop,
-                        &drag_for_drop,
-                        &app_hint_for_drop,
-                    );
-
-                    status_icon_for_drop.set_icon_name(Some("emblem-ok-symbolic"));
-
-                    return true;
-                }
-
-                match installer::install(&path, &info) {
-                    Ok(installed_path) => {
-                        status_for_drop.set_text(&format!(
-                            "{} installed successfully · {}",
-                            info.name,
-                            installed_path.display(),
-                        ));
-
-                        set_installed_view(
-                            true,
-                            &arrow_for_drop,
-                            &folder_card_for_drop,
-                            &choose_for_drop,
-                            &uninstall_for_drop,
-                            &drag_for_drop,
-                            &app_hint_for_drop,
-                        );
-
-                        folder_icon_for_drop.set_icon_name(Some("emblem-ok-symbolic"));
-                        folder_hint_for_drop.set_text("Installed!");
-
-                        status_icon_for_drop.set_icon_name(Some("emblem-ok-symbolic"));
-                    }
-                    Err(error) => {
-                        status_for_drop.set_text(&format!("Installation failed: {error}"));
-                        status_icon_for_drop.set_icon_name(Some("dialog-error-symbolic"));
-                    }
-                }
-            }
-            Err(error) => {
-                status_for_drop.set_text(&format!("Could not inspect AppImage: {error}"));
-                status_icon_for_drop.set_icon_name(Some("dialog-error-symbolic"));
-            }
-        }
-
+        ui_for_drop.install();
         true
     });
 
@@ -601,157 +887,23 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
 
     // File chooser.
     let window_for_chooser = window.clone();
-    let icon_for_chooser = app_icon.clone();
-    let name_for_chooser = app_name.clone();
-    let details_for_chooser = app_details.clone();
-    let status_for_chooser = status.clone();
-    let button_for_chooser = uninstall_button.clone();
-    let selected_for_chooser = selected_path.clone();
-    let arrow_for_chooser = arrow.clone();
-    let folder_for_chooser = folder_card.clone();
-    let choose_for_chooser = choose_button.clone();
-    let drag_for_chooser = drag_source.clone();
-    let hint_for_chooser = app_hint.clone();
-    let folder_icon_for_chooser = folder_icon.clone();
-    let folder_hint_for_chooser = folder_hint.clone();
-    let status_icon_for_chooser = status_icon.clone();
+    let ui_for_chooser = ui.clone();
 
     choose_button.connect_clicked(move |_| {
-        let dialog = gtk::FileChooserNative::builder()
-            .title("Choose an AppImage")
-            .transient_for(&window_for_chooser)
-            .action(gtk::FileChooserAction::Open)
-            .accept_label("Select")
-            .cancel_label("Cancel")
-            .build();
-
-        let filter = gtk::FileFilter::new();
-        filter.set_name(Some("AppImage files"));
-        filter.add_pattern("*.AppImage");
-        filter.add_pattern("*.appimage");
-        dialog.add_filter(&filter);
-
-        let icon = icon_for_chooser.clone();
-        let name = name_for_chooser.clone();
-        let details = details_for_chooser.clone();
-        let status = status_for_chooser.clone();
-        let button = button_for_chooser.clone();
-        let selected = selected_for_chooser.clone();
-        let arrow = arrow_for_chooser.clone();
-        let folder = folder_for_chooser.clone();
-        let choose = choose_for_chooser.clone();
-        let drag = drag_for_chooser.clone();
-        let hint = hint_for_chooser.clone();
-        let folder_icon = folder_icon_for_chooser.clone();
-        let folder_hint = folder_hint_for_chooser.clone();
-        let status_icon = status_icon_for_chooser.clone();
-
-        dialog.connect_response(move |dialog, response| {
-            if response == gtk::ResponseType::Accept {
-                match dialog.file().and_then(|file| file.path()) {
-                    Some(path) => {
-                        folder_icon.set_icon_name(Some("folder-symbolic"));
-                        folder_hint.set_text("Drop here to install");
-                        status_icon.set_icon_name(Some("emblem-information-symbolic"));
-
-                        inspect_into_ui(
-                            path, &icon, &name, &details, &status, &arrow, &folder, &choose,
-                            &button, &drag, &hint, &selected,
-                        );
-                    }
-                    None => {
-                        status.set_text("Please select a local file.");
-                    }
-                }
-            }
-
-            dialog.destroy();
+        let ui = ui_for_chooser.clone();
+        library::choose_appimage(&window_for_chooser, "Choose an AppImage", move |path| {
+            ui.inspect(path)
         });
-
-        dialog.show();
     });
 
-    // Uninstaller.
-    let selected_for_uninstall = selected_path.clone();
-    let status_for_uninstall = status.clone();
-    let button_for_uninstall = uninstall_button.clone();
-    let icon_for_uninstall = app_icon.clone();
-    let name_for_uninstall = app_name.clone();
-    let details_for_uninstall = app_details.clone();
-    let arrow_for_uninstall = arrow.clone();
-    let folder_for_uninstall = folder_card.clone();
-    let choose_for_uninstall = choose_button.clone();
-    let drag_for_uninstall = drag_source.clone();
-    let hint_for_uninstall = app_hint.clone();
-    let folder_icon_for_uninstall = folder_icon.clone();
-    let folder_hint_for_uninstall = folder_hint.clone();
-    let status_icon_for_uninstall = status_icon.clone();
+    // Update and uninstall.
+    let ui_for_update = ui.clone();
+    update_button.connect_clicked(move |_| ui_for_update.update());
 
-    uninstall_button.connect_clicked(move |_| {
-        let Some(path) = selected_for_uninstall.borrow().clone() else {
-            status_for_uninstall.set_text("Choose an AppImage first.");
-            return;
-        };
+    let ui_for_uninstall = ui.clone();
+    uninstall_button.connect_clicked(move |_| ui_for_uninstall.uninstall());
 
-        let info = match metadata::inspect(&path) {
-            Ok(info) => info,
-            Err(error) => {
-                status_for_uninstall.set_text(&format!("Could not inspect application: {error}"));
-                return;
-            }
-        };
+    *ui_slot.borrow_mut() = Some(ui.clone());
 
-        match installer::uninstall(&info) {
-            Ok(()) => {
-                status_for_uninstall.set_text(&format!("{} has been uninstalled.", info.name));
-
-                status_icon_for_uninstall.set_icon_name(Some("emblem-ok-symbolic"));
-
-                set_installed_view(
-                    false,
-                    &arrow_for_uninstall,
-                    &folder_for_uninstall,
-                    &choose_for_uninstall,
-                    &button_for_uninstall,
-                    &drag_for_uninstall,
-                    &hint_for_uninstall,
-                );
-
-                icon_for_uninstall.set_icon_name(Some("application-x-executable-symbolic"));
-                name_for_uninstall.set_text("Your AppImage");
-                details_for_uninstall
-                    .set_text("Application removed. The original AppImage is untouched.");
-
-                folder_icon_for_uninstall.set_icon_name(Some("folder-symbolic"));
-                folder_hint_for_uninstall.set_text("Drop here to install");
-
-                *selected_for_uninstall.borrow_mut() = None;
-            }
-            Err(error) => {
-                status_for_uninstall.set_text(&format!("Uninstallation failed: {error}"));
-
-                status_icon_for_uninstall.set_icon_name(Some("dialog-error-symbolic"));
-            }
-        }
-    });
-
-    window.present();
-
-    // Open directly with an AppImage argument.
-    if let Some(path) = initial_path {
-        inspect_into_ui(
-            path,
-            &app_icon,
-            &app_name,
-            &app_details,
-            &status,
-            &arrow,
-            &folder_card,
-            &choose_button,
-            &uninstall_button,
-            &drag_source,
-            &app_hint,
-            &selected_path,
-        );
-    }
+    AppWindow { window, stack, ui }
 }

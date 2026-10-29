@@ -1,8 +1,10 @@
 [package]
 name = "appdrop"
-version = "0.1.0"
+version = "1.0.1"
 edition = "2024"
+description = "A polished GTK4 AppImage installer and manager"
+license = "MIT"
 
 [dependencies]
 gtk4 = { version = "0.10", features = ["v4_6"] }
-libadwaita = { version = "0.8", package = "libadwaita", features = ["v1_4"] }
+libadwaita = { version = "0.8", package = "libadwaita", features = ["v1_5"] }

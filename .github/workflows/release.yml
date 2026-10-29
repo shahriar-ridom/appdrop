@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  binary-and-deb:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev squashfs-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package binary
+        run: |
+          mkdir dist
+          strip target/release/appdrop
+          cp target/release/appdrop "dist/appdrop-${VERSION}-linux-x86_64"
+          tar -czf "dist/appdrop-${VERSION}-linux-x86_64.tar.gz" \
+            -C target/release appdrop -C ../.. LICENSE
+
+      - name: Package deb
+        run: |
+          root=packaging/debian/appdrop
+          install -Dm755 target/release/appdrop "$root/usr/bin/appdrop"
+          sed -i "s/^Version:.*/Version: ${VERSION}-1/" "$root/DEBIAN/control"
+          dpkg-deb --build --root-owner-group "$root" "dist/appdrop_${VERSION}-1_amd64.deb"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-and-deb
+          path: dist/*
+
+  arch:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm git rust gtk4 libadwaita squashfs-tools
+
+      - uses: actions/checkout@v4
+
+      - name: Build package
+        run: |
+          export VERSION="${GITHUB_REF_NAME#v}"
+          useradd -m builder
+          mkdir /build
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git archive --prefix=appdrop/ -o /build/appdrop.tar.gz HEAD
+          # Build from the tagged checkout instead of cloning main
+          perl -0pe 's/source=\(.*?\)/source=("appdrop.tar.gz")/s; s/^pkgver=.*/pkgver=$ENV{VERSION}/m' \
+            packaging/arch/PKGBUILD > /build/PKGBUILD
+          chown -R builder /build
+          cd /build
+          su builder -c "makepkg --nodeps --nocheck --noconfirm"
+
+      - name: Collect package
+        run: |
+          mkdir dist
+          cp /build/appdrop-*.pkg.tar.zst dist/
+          rm -f dist/appdrop-debug-*
+          ls dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch
+          path: dist/*
+
+  release:
+    needs: [binary-and-deb, arch]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

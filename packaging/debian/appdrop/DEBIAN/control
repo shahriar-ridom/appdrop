@@ -1,6 +1,6 @@
 
 Package: appdrop
-Version: 0.1.0-1
+Version: 1.0.1-1
 Section: utils
 Priority: optional
 Architecture: amd64

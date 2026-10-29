@@ -1,1 +1,9 @@
 /target
+
+# Packaging build output
+/packaging/arch/pkg/
+/packaging/arch/src/
+/packaging/arch/appdrop/
+/packaging/arch/*.pkg.tar.zst
+/packaging/debian/*.deb
+/packaging/debian/appdrop/usr/bin/
